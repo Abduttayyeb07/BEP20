@@ -1080,7 +1080,7 @@ async function handleTelegramCommand(
       await safeSendTelegramMessage(
         input.telegramToken,
         input.replyChatId,
-        "Commands:\n/verify <block>\n/verify <fromBlock> <toBlock>\n/chatid\n\nRange limit: 10 blocks.",
+        "Commands:\n<code>/verify 98456008</code>\n<code>/verify 98456008 98456013</code>\n<code>/chatid</code>\n\nRange limit: 10 blocks.",
         input.telegramTimeoutMs,
         input.telegramRetries,
         "help command"
@@ -1095,7 +1095,7 @@ async function handleTelegramCommand(
     await safeSendTelegramMessage(
       input.telegramToken,
       input.replyChatId,
-      "Usage: /verify <block> or /verify <fromBlock> <toBlock>",
+      "Usage:\n<code>/verify 98456008</code>\nor\n<code>/verify 98456008 98456013</code>",
       input.telegramTimeoutMs,
       input.telegramRetries,
       "verify usage"
