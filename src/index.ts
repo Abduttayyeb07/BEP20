@@ -1,7 +1,15 @@
 import "dotenv/config";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { Contract, FetchRequest, JsonRpcProvider, WebSocketProvider, isAddress, type Log } from "ethers";
+import {
+  Contract,
+  FetchRequest,
+  JsonRpcProvider,
+  WebSocketProvider,
+  formatEther,
+  isAddress,
+  type Log
+} from "ethers";
 
 const USDT_ADDRESS = "0x55d398326f99059fF775485246999027B3197955";
 const TRANSFER_TOPIC =
@@ -11,7 +19,8 @@ const CHAIN_ID = 56n;
 const ERC20_ABI = [
   "event Transfer(address indexed from, address indexed to, uint256 value)",
   "function decimals() view returns (uint8)",
-  "function symbol() view returns (string)"
+  "function symbol() view returns (string)",
+  "function balanceOf(address account) view returns (uint256)"
 ] as const;
 
 type WalletConfig = {
@@ -24,7 +33,7 @@ type SavedState = {
 };
 
 type TransferAlert = {
-  direction: "Received" | "Sent";
+  direction: "Inflow" | "Outflow";
   wallet: WalletConfig;
   amount: string;
   symbol: string;
@@ -65,6 +74,7 @@ type IndexedApiConfig = {
 
 type RpcProvider = {
   getBlockNumber(): Promise<number>;
+  getBalance(address: string): Promise<bigint>;
   getLogs(filter: Parameters<JsonRpcProvider["getLogs"]>[0]): Promise<Log[]>;
 };
 
@@ -79,6 +89,11 @@ class RateLimitedProvider implements RpcProvider {
   async getBlockNumber(): Promise<number> {
     await this.waitForSlot();
     return this.provider.getBlockNumber();
+  }
+
+  async getBalance(address: string): Promise<bigint> {
+    await this.waitForSlot();
+    return this.provider.getBalance(address);
   }
 
   async getLogs(filter: Parameters<JsonRpcProvider["getLogs"]>[0]): Promise<Log[]> {
@@ -265,6 +280,12 @@ function formatTokenAmount(rawValue: bigint, decimals: number): string {
   const trimmedFraction = fractionText.replace(/0+$/, "").slice(0, 6);
 
   return trimmedFraction ? `${whole}.${trimmedFraction}` : whole.toString();
+}
+
+function formatDisplayAmount(value: string): string {
+  const [whole, fraction = ""] = value.split(".");
+  const trimmedFraction = fraction.replace(/0+$/, "").slice(0, 8);
+  return trimmedFraction ? `${whole}.${trimmedFraction}` : whole;
 }
 
 async function readState(path: string): Promise<SavedState | null> {
@@ -493,6 +514,7 @@ async function main(): Promise<void> {
         telegramTimeoutMs,
         telegramRetries,
         pollIntervalMs: telegramCommandPollIntervalMs,
+        watchedWallets,
         walletByAddress,
         walletTopics,
         symbol,
@@ -731,7 +753,7 @@ function buildTransferAlert(input: {
   if (!wallet) return null;
 
   return {
-    direction: toWallet ? "Received" : "Sent",
+    direction: toWallet ? "Inflow" : "Outflow",
     wallet,
     amount: formatTokenAmount(args.value, input.decimals),
     symbol: input.symbol,
@@ -761,7 +783,7 @@ function buildTransferAlertMessage(alert: TransferAlert, prefix = ""): string {
 
 function buildTestAlertMessage(wallet: WalletConfig, symbol: string): string {
   return [
-    `<b>TEST ${escapeHtml(symbol)} Received</b>`,
+    `<b>TEST ${escapeHtml(symbol)} Inflow</b>`,
     "",
     `<b>Wallet:</b> ${escapeHtml(wallet.label)}`,
     "<b>Amount:</b> 0 TEST",
@@ -909,8 +931,8 @@ async function startWebSocketMonitor(input: {
         decimals: input.decimals
       });
       if (!alert) return;
-      if (alert.direction === "Received" && !input.alertIncoming) return;
-      if (alert.direction === "Sent" && !input.alertOutgoing) return;
+      if (alert.direction === "Inflow" && !input.alertIncoming) return;
+      if (alert.direction === "Outflow" && !input.alertOutgoing) return;
       matchedCount += 1;
 
       console.log(
@@ -970,6 +992,7 @@ function startTelegramCommandPoller(input: {
   telegramTimeoutMs: number;
   telegramRetries: number;
   pollIntervalMs: number;
+  watchedWallets: WalletConfig[];
   walletByAddress: Map<string, WalletConfig>;
   walletTopics: string[];
   symbol: string;
@@ -1055,6 +1078,7 @@ async function handleTelegramCommand(
     telegramRetries: number;
     walletByAddress: Map<string, WalletConfig>;
     walletTopics: string[];
+    watchedWallets: WalletConfig[];
     symbol: string;
     decimals: number;
     alertIncoming: boolean;
@@ -1067,7 +1091,9 @@ async function handleTelegramCommand(
   const command = commandWithBot.split("@")[0]?.toLowerCase();
 
   if (command !== "/verify") {
-    if (command === "/chatid") {
+    if (command === "/balances") {
+      await handleBalancesCommand(input);
+    } else if (command === "/chatid") {
       await safeSendTelegramMessage(
         input.telegramToken,
         input.replyChatId,
@@ -1080,7 +1106,7 @@ async function handleTelegramCommand(
       await safeSendTelegramMessage(
         input.telegramToken,
         input.replyChatId,
-        "Commands:\n<code>/verify 98456008</code>\n<code>/verify 98456008 98456013</code>\n<code>/chatid</code>\n\nRange limit: 10 blocks.",
+        "Commands:\n<code>/balances</code>\n<code>/verify 98456008</code>\n<code>/verify 98456008 98456013</code>\n<code>/chatid</code>\n\nRange limit: 10 blocks.",
         input.telegramTimeoutMs,
         input.telegramRetries,
         "help command"
@@ -1177,6 +1203,55 @@ async function handleTelegramCommand(
   }
 }
 
+async function handleBalancesCommand(input: {
+  provider: RpcProvider;
+  usdt: Contract;
+  telegramToken: string;
+  replyChatId: string;
+  telegramTimeoutMs: number;
+  telegramRetries: number;
+  watchedWallets: WalletConfig[];
+  symbol: string;
+  decimals: number;
+}): Promise<void> {
+  try {
+    const lines = ["<b>Wallet Balances</b>", ""];
+
+    for (const wallet of input.watchedWallets) {
+      const [rawTokenBalance, rawBnbBalance] = await Promise.all([
+        input.usdt.balanceOf(wallet.address) as Promise<bigint>,
+        input.provider.getBalance(wallet.address)
+      ]);
+      const tokenBalance = formatTokenAmount(rawTokenBalance, input.decimals);
+      const bnbBalance = formatDisplayAmount(formatEther(rawBnbBalance));
+
+      lines.push(`<b>${escapeHtml(wallet.label)}</b>`);
+      lines.push(`BNB: ${escapeHtml(bnbBalance)} BNB`);
+      lines.push(`${escapeHtml(input.symbol)}: ${escapeHtml(tokenBalance)} ${escapeHtml(input.symbol)}`);
+      lines.push(`<code>${escapeHtml(wallet.address)}</code>`);
+      lines.push("");
+    }
+
+    await safeSendTelegramMessage(
+      input.telegramToken,
+      input.replyChatId,
+      lines.join("\n").trim(),
+      input.telegramTimeoutMs,
+      input.telegramRetries,
+      "balances command"
+    );
+  } catch (error) {
+    await safeSendTelegramMessage(
+      input.telegramToken,
+      input.replyChatId,
+      `Balance lookup failed: ${formatError(error)}`,
+      input.telegramTimeoutMs,
+      input.telegramRetries,
+      "balances command failed"
+    );
+  }
+}
+
 async function fetchIndexedTransferAlerts(input: {
   indexedApi: IndexedApiConfig;
   wallets: WalletConfig[];
@@ -1235,9 +1310,9 @@ async function fetchIndexedTransferAlerts(input: {
       const matchedWallet = toWallet ?? fromWallet;
       if (!matchedWallet) continue;
 
-      const direction = toWallet ? "Received" : "Sent";
-      if (direction === "Received" && !input.alertIncoming) continue;
-      if (direction === "Sent" && !input.alertOutgoing) continue;
+      const direction = toWallet ? "Inflow" : "Outflow";
+      if (direction === "Inflow" && !input.alertIncoming) continue;
+      if (direction === "Outflow" && !input.alertOutgoing) continue;
 
       const transferDecimals = Number(transfer.tokenDecimal ?? input.decimals);
       alerts.push({
