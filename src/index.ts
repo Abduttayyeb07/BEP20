@@ -451,6 +451,7 @@ async function main(): Promise<void> {
   console.log(`Watching ${symbol} transfers on BSC mainnet`);
   console.log(`RPC: ${rpcUrl}`);
   console.log(`Wallets: ${watchedWallets.map((wallet) => wallet.label).join(", ")}`);
+  console.log(`Telegram chat IDs: ${telegramChatIds.join(", ")}`);
   console.log(`Starting after block ${lastProcessedBlock}`);
   if (useWebSocket) {
     console.log(`WebSocket live endpoint(s): ${wsUrls.join(", ")}`);
@@ -1066,11 +1067,20 @@ async function handleTelegramCommand(
   const command = commandWithBot.split("@")[0]?.toLowerCase();
 
   if (command !== "/verify") {
-    if (command === "/start" || command === "/help") {
+    if (command === "/chatid") {
       await safeSendTelegramMessage(
         input.telegramToken,
         input.replyChatId,
-        "Commands:\n/verify <block>\n/verify <fromBlock> <toBlock>\n\nRange limit: 10 blocks.",
+        `This chat ID is:\n<code>${escapeHtml(input.replyChatId)}</code>`,
+        input.telegramTimeoutMs,
+        input.telegramRetries,
+        "chatid command"
+      );
+    } else if (command === "/start" || command === "/help") {
+      await safeSendTelegramMessage(
+        input.telegramToken,
+        input.replyChatId,
+        "Commands:\n/verify <block>\n/verify <fromBlock> <toBlock>\n/chatid\n\nRange limit: 10 blocks.",
         input.telegramTimeoutMs,
         input.telegramRetries,
         "help command"

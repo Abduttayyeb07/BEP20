@@ -112,8 +112,9 @@ When `TELEGRAM_COMMANDS_ENABLED=true`, send commands to the bot chat:
 ```text
 /verify 98456008
 /verify 98456008 98456013
+/chatid
 ```
 
-The range is capped at 10 blocks. The bot replies with matching transfers or a no-match message.
+The range is capped at 10 blocks. The bot replies with matching transfers or a no-match message. `/chatid` replies with the exact Telegram Bot API chat ID for the chat where it was sent.
 
 `LOG_SCAN_PROGRESS=true` prints each scanned block range and the number of matching logs found.
