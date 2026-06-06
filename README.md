@@ -3,7 +3,7 @@
 Dockerized TypeScript bot that watches USDT transfers on BNB Smart Chain and sends Telegram alerts for:
 
 ```bash
-WATCHED_WALLETS=Valdora Zignaly=0x2d75e203c7bC5b51C71df881AF1857cE233eb2C8,Nawa Zignaly=0x6a9d07A5aad5550b90Cb07E81374ef32dEe29eE0
+WATCHED_WALLETS=Valdora Zignaly=0x2d75,Nawa Zignaly=0x6a9d
 ```
 
 ## Setup
