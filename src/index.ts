@@ -107,6 +107,26 @@ function requiredEnv(name: string): string {
   return value;
 }
 
+function getTelegramChatIds(): string[] {
+  const multiValue = process.env.TELEGRAM_CHAT_IDS?.trim();
+  const singleValue = process.env.TELEGRAM_CHAT_ID?.trim();
+  const rawValue = multiValue || singleValue;
+  if (!rawValue) {
+    throw new Error("Missing required environment variable: TELEGRAM_CHAT_IDS or TELEGRAM_CHAT_ID");
+  }
+
+  const chatIds = rawValue
+    .split(",")
+    .map((chatId) => chatId.trim())
+    .filter(Boolean);
+
+  if (chatIds.length === 0) {
+    throw new Error("TELEGRAM_CHAT_IDS must contain at least one chat ID");
+  }
+
+  return [...new Set(chatIds)];
+}
+
 function optionalNumberEnv(name: string, fallback: number): number {
   const value = process.env[name]?.trim();
   if (!value) return fallback;
@@ -321,9 +341,34 @@ async function safeSendTelegramMessage(
   }
 }
 
+async function sendTelegramBroadcast(
+  token: string,
+  chatIds: string[],
+  message: string,
+  timeoutMs: number,
+  retries: number
+): Promise<void> {
+  for (const chatId of chatIds) {
+    await sendTelegramMessage(token, chatId, message, timeoutMs, retries);
+  }
+}
+
+async function safeSendTelegramBroadcast(
+  token: string,
+  chatIds: string[],
+  message: string,
+  timeoutMs: number,
+  retries: number,
+  label: string
+): Promise<void> {
+  for (const chatId of chatIds) {
+    await safeSendTelegramMessage(token, chatId, message, timeoutMs, retries, `${label} to ${chatId}`);
+  }
+}
+
 async function main(): Promise<void> {
   const telegramToken = requiredEnv("TELEGRAM_BOT_TOKEN");
-  const telegramChatId = requiredEnv("TELEGRAM_CHAT_ID");
+  const telegramChatIds = getTelegramChatIds();
   const telegramTimeoutMs = optionalNumberEnv("TELEGRAM_TIMEOUT_MS", 20_000);
   const telegramRetries = optionalNumberEnv("TELEGRAM_RETRIES", 3);
   const telegramCommandsEnabled = optionalBooleanEnv("TELEGRAM_COMMANDS_ENABLED", true);
@@ -422,7 +467,7 @@ async function main(): Promise<void> {
       provider: rateLimitedProvider,
       usdt,
       telegramToken,
-      telegramChatId,
+      telegramChatIds,
       telegramTimeoutMs,
       telegramRetries,
       walletByAddress,
@@ -443,7 +488,7 @@ async function main(): Promise<void> {
         provider: rateLimitedProvider,
         usdt,
         telegramToken,
-        telegramChatId,
+        allowedChatIds: telegramChatIds,
         telegramTimeoutMs,
         telegramRetries,
         pollIntervalMs: telegramCommandPollIntervalMs,
@@ -471,9 +516,9 @@ async function main(): Promise<void> {
       `<b>Starting after block:</b> ${lastProcessedBlock}`
     ].join("\n");
 
-    await safeSendTelegramMessage(
+    await safeSendTelegramBroadcast(
       telegramToken,
-      telegramChatId,
+      telegramChatIds,
       startupMessage,
       telegramTimeoutMs,
       telegramRetries,
@@ -483,9 +528,9 @@ async function main(): Promise<void> {
 
   if (sendTestAlertsOnStartup) {
     for (const wallet of watchedWallets) {
-      await safeSendTelegramMessage(
+      await safeSendTelegramBroadcast(
         telegramToken,
-        telegramChatId,
+        telegramChatIds,
         buildTestAlertMessage(wallet, symbol),
         telegramTimeoutMs,
         telegramRetries,
@@ -500,7 +545,7 @@ async function main(): Promise<void> {
       provider: rateLimitedProvider,
       usdt,
       telegramToken,
-      telegramChatId,
+      telegramChatIds,
       telegramTimeoutMs,
       telegramRetries,
       walletByAddress,
@@ -524,7 +569,7 @@ async function main(): Promise<void> {
       wsUrls,
       usdt,
       telegramToken,
-      telegramChatId,
+      telegramChatIds,
       telegramTimeoutMs,
       telegramRetries,
       walletByAddress,
@@ -631,9 +676,9 @@ async function main(): Promise<void> {
         });
         if (!alert) continue;
 
-        await sendTelegramMessage(
+        await sendTelegramBroadcast(
           telegramToken,
-          telegramChatId,
+          telegramChatIds,
           buildTransferAlertMessage(alert),
           telegramTimeoutMs,
           telegramRetries
@@ -648,9 +693,9 @@ async function main(): Promise<void> {
         if (seenAlerts.has(alertKey)) continue;
         seenAlerts.add(alertKey);
 
-        await sendTelegramMessage(
+        await sendTelegramBroadcast(
           telegramToken,
-          telegramChatId,
+          telegramChatIds,
           buildTransferAlertMessage(alert),
           telegramTimeoutMs,
           telegramRetries
@@ -736,7 +781,7 @@ async function verifyHistoricalRange(input: {
   provider: RpcProvider;
   usdt: Contract;
   telegramToken: string;
-  telegramChatId: string;
+  telegramChatIds: string[];
   telegramTimeoutMs: number;
   telegramRetries: number;
   walletByAddress: Map<string, WalletConfig>;
@@ -788,9 +833,9 @@ async function verifyHistoricalRange(input: {
     });
     if (!alert) continue;
 
-    await sendTelegramMessage(
+    await sendTelegramBroadcast(
       input.telegramToken,
-      input.telegramChatId,
+      input.telegramChatIds,
       buildTransferAlertMessage(alert, "HISTORICAL VERIFY "),
       input.telegramTimeoutMs,
       input.telegramRetries
@@ -812,7 +857,7 @@ async function startWebSocketMonitor(input: {
   wsUrls: string[];
   usdt: Contract;
   telegramToken: string;
-  telegramChatId: string;
+  telegramChatIds: string[];
   telegramTimeoutMs: number;
   telegramRetries: number;
   walletByAddress: Map<string, WalletConfig>;
@@ -871,9 +916,9 @@ async function startWebSocketMonitor(input: {
         `WebSocket matched ${alert.symbol} ${alert.direction}: wallet=${alert.wallet.label}, amount=${alert.amount}, block=${alert.blockNumber}, tx=${alert.transactionHash}`
       );
 
-      await sendTelegramMessage(
+      await sendTelegramBroadcast(
         input.telegramToken,
-        input.telegramChatId,
+        input.telegramChatIds,
         buildTransferAlertMessage(alert),
         input.telegramTimeoutMs,
         input.telegramRetries
@@ -920,7 +965,7 @@ function startTelegramCommandPoller(input: {
   provider: RpcProvider;
   usdt: Contract;
   telegramToken: string;
-  telegramChatId: string;
+  allowedChatIds: string[];
   telegramTimeoutMs: number;
   telegramRetries: number;
   pollIntervalMs: number;
@@ -951,9 +996,10 @@ function startTelegramCommandPoller(input: {
         const message = update.message;
         const text = message?.text?.trim();
         if (!message || !text) continue;
-        if (String(message.chat.id) !== String(input.telegramChatId)) continue;
+        const replyChatId = String(message.chat.id);
+        if (!input.allowedChatIds.includes(replyChatId)) continue;
 
-        await handleTelegramCommand(input, text);
+        await handleTelegramCommand({ ...input, replyChatId }, text);
       }
     } catch (error) {
       console.warn(`Telegram command poll failed: ${formatError(error)}`);
@@ -1002,7 +1048,8 @@ async function handleTelegramCommand(
     provider: RpcProvider;
     usdt: Contract;
     telegramToken: string;
-    telegramChatId: string;
+    allowedChatIds: string[];
+    replyChatId: string;
     telegramTimeoutMs: number;
     telegramRetries: number;
     walletByAddress: Map<string, WalletConfig>;
@@ -1022,7 +1069,7 @@ async function handleTelegramCommand(
     if (command === "/start" || command === "/help") {
       await safeSendTelegramMessage(
         input.telegramToken,
-        input.telegramChatId,
+        input.replyChatId,
         "Commands:\n/verify <block>\n/verify <fromBlock> <toBlock>\n\nRange limit: 10 blocks.",
         input.telegramTimeoutMs,
         input.telegramRetries,
@@ -1037,7 +1084,7 @@ async function handleTelegramCommand(
   if (!Number.isSafeInteger(fromBlock) || !Number.isSafeInteger(toBlock) || fromBlock < 0 || toBlock < 0) {
     await safeSendTelegramMessage(
       input.telegramToken,
-      input.telegramChatId,
+      input.replyChatId,
       "Usage: /verify <block> or /verify <fromBlock> <toBlock>",
       input.telegramTimeoutMs,
       input.telegramRetries,
@@ -1049,7 +1096,7 @@ async function handleTelegramCommand(
   if (toBlock < fromBlock) {
     await safeSendTelegramMessage(
       input.telegramToken,
-      input.telegramChatId,
+      input.replyChatId,
       "Invalid range: toBlock must be greater than or equal to fromBlock.",
       input.telegramTimeoutMs,
       input.telegramRetries,
@@ -1061,7 +1108,7 @@ async function handleTelegramCommand(
   if (toBlock - fromBlock + 1 > 10) {
     await safeSendTelegramMessage(
       input.telegramToken,
-      input.telegramChatId,
+      input.replyChatId,
       "Range too large. Use 10 blocks or fewer.",
       input.telegramTimeoutMs,
       input.telegramRetries,
@@ -1072,7 +1119,7 @@ async function handleTelegramCommand(
 
   await safeSendTelegramMessage(
     input.telegramToken,
-    input.telegramChatId,
+    input.replyChatId,
     `Scanning BSC blocks ${fromBlock}-${toBlock} for watched-wallet ${input.symbol} transfers...`,
     input.telegramTimeoutMs,
     input.telegramRetries,
@@ -1084,7 +1131,7 @@ async function handleTelegramCommand(
       provider: input.provider,
       usdt: input.usdt,
       telegramToken: input.telegramToken,
-      telegramChatId: input.telegramChatId,
+      telegramChatIds: [input.replyChatId],
       telegramTimeoutMs: input.telegramTimeoutMs,
       telegramRetries: input.telegramRetries,
       walletByAddress: input.walletByAddress,
@@ -1101,7 +1148,7 @@ async function handleTelegramCommand(
     if (sent === 0) {
       await safeSendTelegramMessage(
         input.telegramToken,
-        input.telegramChatId,
+        input.replyChatId,
         `No matching watched-wallet ${input.symbol} transfers found in blocks ${fromBlock}-${toBlock}.`,
         input.telegramTimeoutMs,
         input.telegramRetries,
@@ -1111,7 +1158,7 @@ async function handleTelegramCommand(
   } catch (error) {
     await safeSendTelegramMessage(
       input.telegramToken,
-      input.telegramChatId,
+      input.replyChatId,
       `Verify failed for blocks ${fromBlock}-${toBlock}: ${formatError(error)}`,
       input.telegramTimeoutMs,
       input.telegramRetries,
@@ -1203,7 +1250,7 @@ async function sendRecentRealTransferAlerts(input: {
   provider: RpcProvider;
   usdt: Contract;
   telegramToken: string;
-  telegramChatId: string;
+  telegramChatIds: string[];
   telegramTimeoutMs: number;
   telegramRetries: number;
   walletByAddress: Map<string, WalletConfig>;
@@ -1252,9 +1299,9 @@ async function sendRecentRealTransferAlerts(input: {
       const alreadySent = sentByWallet.get(walletKey) ?? 0;
       if (alreadySent >= input.maxPerWallet) continue;
 
-      await sendTelegramMessage(
+      await sendTelegramBroadcast(
         input.telegramToken,
-        input.telegramChatId,
+        input.telegramChatIds,
         buildTransferAlertMessage(alert, "RECENT REAL ON-CHAIN "),
         input.telegramTimeoutMs,
         input.telegramRetries
@@ -1316,9 +1363,9 @@ async function sendRecentRealTransferAlerts(input: {
       const alreadySent = sentByWallet.get(walletKey) ?? 0;
       if (alreadySent >= input.maxPerWallet) continue;
 
-      await sendTelegramMessage(
+      await sendTelegramBroadcast(
         input.telegramToken,
-        input.telegramChatId,
+        input.telegramChatIds,
         buildTransferAlertMessage(alert, "RECENT REAL ON-CHAIN "),
         input.telegramTimeoutMs,
         input.telegramRetries
@@ -1339,9 +1386,9 @@ async function sendRecentRealTransferAlerts(input: {
   if (sentByWallet.size === 0) {
     console.log("No recent real matching USDT transfers found for startup replay");
     if (input.alertWhenNoneFound) {
-      await safeSendTelegramMessage(
+      await safeSendTelegramBroadcast(
         input.telegramToken,
-        input.telegramChatId,
+        input.telegramChatIds,
         [
           "<b>BSC USDT monitor live</b>",
           "",

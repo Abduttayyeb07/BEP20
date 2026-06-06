@@ -15,8 +15,17 @@ WATCHED_WALLETS=Valdora Zignaly=0x2d75e203c7bC5b51C71df881AF1857cE233eb2C8,Nawa 
 ```bash
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
+TELEGRAM_CHAT_IDS=...
 WATCHED_WALLETS=Valdora Zignaly=0x2d75e203c7bC5b51C71df881AF1857cE233eb2C8,Nawa Zignaly=0x6a9d07A5aad5550b90Cb07E81374ef32dEe29eE0
 ```
+
+For multiple Telegram destinations, use comma-separated IDs:
+
+```bash
+TELEGRAM_CHAT_IDS=8010090311,123456789,-1001234567890
+```
+
+`TELEGRAM_CHAT_ID` is kept for single-chat backward compatibility.
 
 4. Build and run:
 
