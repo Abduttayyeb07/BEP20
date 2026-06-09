@@ -36,11 +36,23 @@ type TransferAlert = {
   direction: "Inflow" | "Outflow";
   wallet: WalletConfig;
   amount: string;
+  rawValue: bigint;
   symbol: string;
   from: string;
   to: string;
   transactionHash: string;
   blockNumber: number;
+};
+
+type LiveStats = {
+  wsDecoded: number;
+  wsMatched: number;
+  httpScannedBlocks: number;
+  httpMatched: number;
+  deliveredAlerts: number;
+  lastHttpBlock: number;
+  lastWsBlock: number;
+  startedAt: number;
 };
 
 type IndexedTransfer = {
@@ -123,23 +135,41 @@ function requiredEnv(name: string): string {
 }
 
 function getTelegramChatIds(): string[] {
-  const multiValue = process.env.TELEGRAM_CHAT_IDS?.trim();
-  const singleValue = process.env.TELEGRAM_CHAT_ID?.trim();
+  return getCommaSeparatedEnvValues("TELEGRAM_CHAT_IDS", "TELEGRAM_CHAT_ID", true);
+}
+
+function getTelegramHealthChatIds(fallbackChatIds: string[]): string[] {
+  const values = getCommaSeparatedEnvValues("TELEGRAM_HEALTH_CHAT_IDS", undefined, false);
+  return values.length > 0 ? values : fallbackChatIds;
+}
+
+function getCommaSeparatedEnvValues(
+  multiName: string,
+  singleName: string | undefined,
+  required: boolean
+): string[] {
+  const multiValue = process.env[multiName]?.trim();
+  const singleValue = singleName ? process.env[singleName]?.trim() : "";
   const rawValue = multiValue || singleValue;
   if (!rawValue) {
-    throw new Error("Missing required environment variable: TELEGRAM_CHAT_IDS or TELEGRAM_CHAT_ID");
+    if (required) {
+      throw new Error(
+        `Missing required environment variable: ${singleName ? `${multiName} or ${singleName}` : multiName}`
+      );
+    }
+    return [];
   }
 
-  const chatIds = rawValue
+  const values = rawValue
     .split(",")
-    .map((chatId) => chatId.trim())
+    .map((value) => value.trim())
     .filter(Boolean);
 
-  if (chatIds.length === 0) {
-    throw new Error("TELEGRAM_CHAT_IDS must contain at least one chat ID");
+  if (required && values.length === 0) {
+    throw new Error(`${multiName} must contain at least one value`);
   }
 
-  return [...new Set(chatIds)];
+  return [...new Set(values)];
 }
 
 function optionalNumberEnv(name: string, fallback: number): number {
@@ -390,6 +420,7 @@ async function safeSendTelegramBroadcast(
 async function main(): Promise<void> {
   const telegramToken = requiredEnv("TELEGRAM_BOT_TOKEN");
   const telegramChatIds = getTelegramChatIds();
+  const telegramHealthChatIds = getTelegramHealthChatIds(telegramChatIds);
   const telegramTimeoutMs = optionalNumberEnv("TELEGRAM_TIMEOUT_MS", 20_000);
   const telegramRetries = optionalNumberEnv("TELEGRAM_RETRIES", 3);
   const telegramCommandsEnabled = optionalBooleanEnv("TELEGRAM_COMMANDS_ENABLED", true);
@@ -403,10 +434,16 @@ async function main(): Promise<void> {
     "WEBSOCKET_DECODED_SUMMARY_INTERVAL_MS",
     30_000
   );
+  const telegramHealthUpdateEnabled = optionalBooleanEnv("TELEGRAM_HEALTH_UPDATE_ENABLED", true);
+  const telegramHealthUpdateIntervalMs = optionalNumberEnv(
+    "TELEGRAM_HEALTH_UPDATE_INTERVAL_MS",
+    3_600_000
+  );
   const rpcTimeoutMs = optionalNumberEnv("RPC_TIMEOUT_MS", 10_000);
   const rpcMinDelayMs = optionalNumberEnv("RPC_MIN_DELAY_MS", 400);
   const symbol = process.env.TOKEN_SYMBOL?.trim() || "USDT";
   const decimals = optionalNumberEnv("TOKEN_DECIMALS", 18);
+  const minAlertRawValue = parseTokenAmount(process.env.MIN_ALERT_AMOUNT?.trim() || "1", decimals);
   const indexedApi = getIndexedApiConfig();
   const pollIntervalMs = optionalNumberEnv("POLL_INTERVAL_MS", 10_000);
   const confirmations = optionalNumberEnv("CONFIRMATIONS", 1);
@@ -466,6 +503,17 @@ async function main(): Promise<void> {
     startFromLatestOnBoot
       ? Math.max(0, currentBlock - confirmations)
       : savedState?.lastProcessedBlock ?? Math.max(0, currentBlock - confirmations);
+  const deliveredAlertKeys = new Set<string>();
+  const liveStats: LiveStats = {
+    wsDecoded: 0,
+    wsMatched: 0,
+    httpScannedBlocks: 0,
+    httpMatched: 0,
+    deliveredAlerts: 0,
+    lastHttpBlock: lastProcessedBlock,
+    lastWsBlock: 0,
+    startedAt: Date.now()
+  };
 
   await writeState(stateFile, { lastProcessedBlock });
 
@@ -473,6 +521,7 @@ async function main(): Promise<void> {
   console.log(`RPC: ${rpcUrl}`);
   console.log(`Wallets: ${watchedWallets.map((wallet) => wallet.label).join(", ")}`);
   console.log(`Telegram chat IDs: ${telegramChatIds.join(", ")}`);
+  console.log(`Telegram health chat IDs: ${telegramHealthChatIds.join(", ")}`);
   console.log(`Starting after block ${lastProcessedBlock}`);
   if (useWebSocket) {
     console.log(`WebSocket live endpoint(s): ${wsUrls.join(", ")}`);
@@ -496,6 +545,7 @@ async function main(): Promise<void> {
       walletTopics,
       symbol,
       decimals,
+      minAlertRawValue,
       fromBlock: verifyBlock,
       toBlock: verifyToBlock,
       alertIncoming,
@@ -519,6 +569,8 @@ async function main(): Promise<void> {
         walletTopics,
         symbol,
         decimals,
+        minAlertRawValue,
+        liveStats,
         alertIncoming,
         alertOutgoing,
         rpcTimeoutMs
@@ -575,6 +627,7 @@ async function main(): Promise<void> {
       walletTopics,
       symbol,
       decimals,
+      minAlertRawValue,
       currentBlock,
       confirmations,
       blockRange: recentRealAlertBlockRange,
@@ -599,16 +652,29 @@ async function main(): Promise<void> {
       walletTopics,
       symbol,
       decimals,
+      minAlertRawValue,
       alertIncoming,
       alertOutgoing,
       logDecodedSummary: logWebSocketDecodedSummary,
-      decodedSummaryIntervalMs: webSocketDecodedSummaryIntervalMs
+      decodedSummaryIntervalMs: webSocketDecodedSummaryIntervalMs,
+      deliveredAlertKeys,
+      liveStats
     });
 
     console.log("WebSocket live monitoring active");
-    while (true) {
-      await sleep(60_000);
-    }
+    console.log("HTTP backfill monitoring active");
+  }
+
+  if (telegramHealthUpdateEnabled) {
+    startTelegramHealthUpdates({
+      telegramToken,
+      telegramChatIds: telegramHealthChatIds,
+      telegramTimeoutMs,
+      telegramRetries,
+      intervalMs: telegramHealthUpdateIntervalMs,
+      stats: liveStats,
+      symbol
+    });
   }
 
   while (true) {
@@ -638,6 +704,8 @@ async function main(): Promise<void> {
       const fromBlock = lastProcessedBlock + 1;
       const toBlock = Math.min(targetBlock, fromBlock + maxBlockRange - 1);
       const remainingBacklog = targetBlock - lastProcessedBlock;
+      liveStats.lastHttpBlock = toBlock;
+      liveStats.httpScannedBlocks += toBlock - fromBlock + 1;
 
       if (logScanProgress) {
         console.log(
@@ -667,6 +735,7 @@ async function main(): Promise<void> {
           toBlock,
           symbol,
           decimals,
+          minAlertRawValue,
           alertIncoming,
           alertOutgoing,
           sort: "asc",
@@ -676,7 +745,7 @@ async function main(): Promise<void> {
 
       if (logScanProgress) {
         console.log(
-          `Live scan result: ${logs.length + indexedFallbackAlerts.length} matching ${symbol} transfer(s)`
+          `Live scan result: ${logs.length + indexedFallbackAlerts.length} matching ${symbol} transfer(s) | WebSocket decoded total=${liveStats.wsDecoded}, matched total=${liveStats.wsMatched}, last WS block=${liveStats.lastWsBlock || "none"}`
         );
       }
 
@@ -695,9 +764,14 @@ async function main(): Promise<void> {
           parsedArgs: parsed.args,
           walletByAddress,
           symbol,
-          decimals
+          decimals,
+          minAlertRawValue
         });
         if (!alert) continue;
+        const alertKey = buildAlertKey(alert);
+        if (deliveredAlertKeys.has(alertKey)) continue;
+        deliveredAlertKeys.add(alertKey);
+        liveStats.httpMatched += 1;
 
         await sendTelegramBroadcast(
           telegramToken,
@@ -706,6 +780,7 @@ async function main(): Promise<void> {
           telegramTimeoutMs,
           telegramRetries
         );
+        liveStats.deliveredAlerts += 1;
         console.log(
           `${alert.direction} ${alert.amount} ${symbol} for ${alert.wallet.label}: ${log.transactionHash}`
         );
@@ -715,6 +790,9 @@ async function main(): Promise<void> {
         const alertKey = `${alert.transactionHash}:${alert.direction}:${alert.wallet.address}`;
         if (seenAlerts.has(alertKey)) continue;
         seenAlerts.add(alertKey);
+        if (deliveredAlertKeys.has(alertKey)) continue;
+        deliveredAlertKeys.add(alertKey);
+        liveStats.httpMatched += 1;
 
         await sendTelegramBroadcast(
           telegramToken,
@@ -723,6 +801,7 @@ async function main(): Promise<void> {
           telegramTimeoutMs,
           telegramRetries
         );
+        liveStats.deliveredAlerts += 1;
         console.log(
           `${alert.direction} ${alert.amount} ${symbol} for ${alert.wallet.label}: ${alert.transactionHash}`
         );
@@ -743,8 +822,10 @@ function buildTransferAlert(input: {
   walletByAddress: Map<string, WalletConfig>;
   symbol: string;
   decimals: number;
+  minAlertRawValue: bigint;
 }): TransferAlert | null {
   const args = input.parsedArgs as { from: string; to: string; value: bigint };
+  if (args.value < input.minAlertRawValue) return null;
   const from = args.from;
   const to = args.to;
   const fromWallet = input.walletByAddress.get(normalizeAddress(from));
@@ -756,6 +837,7 @@ function buildTransferAlert(input: {
     direction: toWallet ? "Inflow" : "Outflow",
     wallet,
     amount: formatTokenAmount(args.value, input.decimals),
+    rawValue: args.value,
     symbol: input.symbol,
     from,
     to,
@@ -779,6 +861,21 @@ function buildTransferAlertMessage(alert: TransferAlert, prefix = ""): string {
     `<b>Block:</b> ${alert.blockNumber}`,
     `<a href="${txUrl}">Open on BscScan</a>`
   ].join("\n");
+}
+
+function parseTokenAmount(value: string, decimals: number): bigint {
+  const trimmed = value.trim();
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) {
+    throw new Error("MIN_ALERT_AMOUNT must be a non-negative decimal number");
+  }
+
+  const [whole, fraction = ""] = trimmed.split(".");
+  const normalizedFraction = fraction.padEnd(decimals, "0").slice(0, decimals);
+  return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(normalizedFraction || "0");
+}
+
+function buildAlertKey(alert: TransferAlert): string {
+  return `${alert.transactionHash}:${alert.direction}:${normalizeAddress(alert.wallet.address)}`;
 }
 
 function buildTestAlertMessage(wallet: WalletConfig, symbol: string): string {
@@ -811,6 +908,7 @@ async function verifyHistoricalRange(input: {
   walletTopics: string[];
   symbol: string;
   decimals: number;
+  minAlertRawValue: bigint;
   fromBlock: number;
   toBlock: number;
   alertIncoming: boolean;
@@ -852,7 +950,8 @@ async function verifyHistoricalRange(input: {
       parsedArgs: parsed.args,
       walletByAddress: input.walletByAddress,
       symbol: input.symbol,
-      decimals: input.decimals
+      decimals: input.decimals,
+      minAlertRawValue: input.minAlertRawValue
     });
     if (!alert) continue;
 
@@ -887,10 +986,13 @@ async function startWebSocketMonitor(input: {
   walletTopics: string[];
   symbol: string;
   decimals: number;
+  minAlertRawValue: bigint;
   alertIncoming: boolean;
   alertOutgoing: boolean;
   logDecodedSummary: boolean;
   decodedSummaryIntervalMs: number;
+  deliveredAlertKeys: Set<string>;
+  liveStats: LiveStats;
 }): Promise<void> {
   const { provider, wsUrl } = await connectWebSocketProvider(input.wsUrls);
   const seenLogs = new Set<string>();
@@ -922,18 +1024,25 @@ async function startWebSocketMonitor(input: {
       const parsed = input.usdt.interface.parseLog(log);
       if (!parsed) return;
       decodedCount += 1;
+      input.liveStats.wsDecoded += 1;
+      input.liveStats.lastWsBlock = Math.max(input.liveStats.lastWsBlock, log.blockNumber);
 
       const alert = buildTransferAlert({
         log,
         parsedArgs: parsed.args,
         walletByAddress: input.walletByAddress,
         symbol: input.symbol,
-        decimals: input.decimals
+        decimals: input.decimals,
+        minAlertRawValue: input.minAlertRawValue
       });
       if (!alert) return;
       if (alert.direction === "Inflow" && !input.alertIncoming) return;
       if (alert.direction === "Outflow" && !input.alertOutgoing) return;
+      const alertKey = buildAlertKey(alert);
+      if (input.deliveredAlertKeys.has(alertKey)) return;
+      input.deliveredAlertKeys.add(alertKey);
       matchedCount += 1;
+      input.liveStats.wsMatched += 1;
 
       console.log(
         `WebSocket matched ${alert.symbol} ${alert.direction}: wallet=${alert.wallet.label}, amount=${alert.amount}, block=${alert.blockNumber}, tx=${alert.transactionHash}`
@@ -946,6 +1055,7 @@ async function startWebSocketMonitor(input: {
         input.telegramTimeoutMs,
         input.telegramRetries
       );
+      input.liveStats.deliveredAlerts += 1;
 
       console.log(
         `WebSocket ${alert.direction.toLowerCase()} ${alert.amount} ${alert.symbol} for ${alert.wallet.label}: ${alert.transactionHash}`
@@ -956,6 +1066,60 @@ async function startWebSocketMonitor(input: {
   });
 
   console.log(`Subscribed to USDT Transfer events over WebSocket: ${wsUrl}`);
+}
+
+function startTelegramHealthUpdates(input: {
+  telegramToken: string;
+  telegramChatIds: string[];
+  telegramTimeoutMs: number;
+  telegramRetries: number;
+  intervalMs: number;
+  stats: LiveStats;
+  symbol: string;
+}): NodeJS.Timeout {
+  let lastWsDecoded = input.stats.wsDecoded;
+  let lastWsMatched = input.stats.wsMatched;
+  let lastHttpScannedBlocks = input.stats.httpScannedBlocks;
+  let lastHttpMatched = input.stats.httpMatched;
+  let lastDeliveredAlerts = input.stats.deliveredAlerts;
+
+  return setInterval(() => {
+    const wsDecodedDelta = input.stats.wsDecoded - lastWsDecoded;
+    const wsMatchedDelta = input.stats.wsMatched - lastWsMatched;
+    const httpScannedDelta = input.stats.httpScannedBlocks - lastHttpScannedBlocks;
+    const httpMatchedDelta = input.stats.httpMatched - lastHttpMatched;
+    const deliveredDelta = input.stats.deliveredAlerts - lastDeliveredAlerts;
+    const uptimeMinutes = Math.floor((Date.now() - input.stats.startedAt) / 60_000);
+
+    lastWsDecoded = input.stats.wsDecoded;
+    lastWsMatched = input.stats.wsMatched;
+    lastHttpScannedBlocks = input.stats.httpScannedBlocks;
+    lastHttpMatched = input.stats.httpMatched;
+    lastDeliveredAlerts = input.stats.deliveredAlerts;
+
+    const message = [
+      "<b>BSC USDT Monitor Health</b>",
+      "",
+      `<b>Window:</b> last ${Math.round(input.intervalMs / 60_000)} minute(s)`,
+      `<b>Uptime:</b> ${uptimeMinutes} minute(s)`,
+      `<b>WebSocket decoded:</b> ${wsDecodedDelta} ${escapeHtml(input.symbol)} Transfer event(s)`,
+      `<b>WebSocket matched:</b> ${wsMatchedDelta}`,
+      `<b>HTTP backfill scanned:</b> ${httpScannedDelta} block(s)`,
+      `<b>HTTP backfill matched:</b> ${httpMatchedDelta}`,
+      `<b>Alerts delivered:</b> ${deliveredDelta}`,
+      `<b>Last WS block:</b> ${input.stats.lastWsBlock || "none"}`,
+      `<b>Last HTTP block:</b> ${input.stats.lastHttpBlock || "none"}`
+    ].join("\n");
+
+    void safeSendTelegramBroadcast(
+      input.telegramToken,
+      input.telegramChatIds,
+      message,
+      input.telegramTimeoutMs,
+      input.telegramRetries,
+      "health update"
+    );
+  }, input.intervalMs);
 }
 
 async function connectWebSocketProvider(
@@ -997,6 +1161,8 @@ function startTelegramCommandPoller(input: {
   walletTopics: string[];
   symbol: string;
   decimals: number;
+  minAlertRawValue: bigint;
+  liveStats: LiveStats;
   alertIncoming: boolean;
   alertOutgoing: boolean;
   rpcTimeoutMs: number;
@@ -1021,8 +1187,12 @@ function startTelegramCommandPoller(input: {
         const text = message?.text?.trim();
         if (!message || !text) continue;
         const replyChatId = String(message.chat.id);
-        if (!input.allowedChatIds.includes(replyChatId)) continue;
+        if (!input.allowedChatIds.includes(replyChatId)) {
+          console.log(`Telegram command ignored from unauthorized chat ${replyChatId}: ${text}`);
+          continue;
+        }
 
+        console.log(`Telegram command received from ${replyChatId}: ${text}`);
         await handleTelegramCommand({ ...input, replyChatId }, text);
       }
     } catch (error) {
@@ -1081,6 +1251,8 @@ async function handleTelegramCommand(
     watchedWallets: WalletConfig[];
     symbol: string;
     decimals: number;
+    minAlertRawValue: bigint;
+    liveStats: LiveStats;
     alertIncoming: boolean;
     alertOutgoing: boolean;
     rpcTimeoutMs: number;
@@ -1091,7 +1263,9 @@ async function handleTelegramCommand(
   const command = commandWithBot.split("@")[0]?.toLowerCase();
 
   if (command !== "/verify") {
-    if (command === "/balances") {
+    if (command === "/status") {
+      await handleStatusCommand(input);
+    } else if (command === "/balances") {
       await handleBalancesCommand(input);
     } else if (command === "/chatid") {
       await safeSendTelegramMessage(
@@ -1106,7 +1280,7 @@ async function handleTelegramCommand(
       await safeSendTelegramMessage(
         input.telegramToken,
         input.replyChatId,
-        "Commands:\n<code>/balances</code>\n<code>/verify 98456008</code>\n<code>/verify 98456008 98456013</code>\n<code>/chatid</code>\n\nRange limit: 10 blocks.",
+        "Commands:\n<code>/status</code>\n<code>/balances</code>\n<code>/verify 98456008</code>\n<code>/verify 98456008 98456013</code>\n<code>/chatid</code>\n\nRange limit: 10 blocks.",
         input.telegramTimeoutMs,
         input.telegramRetries,
         "help command"
@@ -1174,6 +1348,7 @@ async function handleTelegramCommand(
       walletTopics: input.walletTopics,
       symbol: input.symbol,
       decimals: input.decimals,
+      minAlertRawValue: input.minAlertRawValue,
       fromBlock,
       toBlock,
       alertIncoming: input.alertIncoming,
@@ -1252,6 +1427,38 @@ async function handleBalancesCommand(input: {
   }
 }
 
+async function handleStatusCommand(input: {
+  telegramToken: string;
+  replyChatId: string;
+  telegramTimeoutMs: number;
+  telegramRetries: number;
+  symbol: string;
+  liveStats: LiveStats;
+}): Promise<void> {
+  const uptimeMinutes = Math.floor((Date.now() - input.liveStats.startedAt) / 60_000);
+  const message = [
+    "<b>BSC USDT Monitor Status</b>",
+    "",
+    `<b>Uptime:</b> ${uptimeMinutes} minute(s)`,
+    `<b>WebSocket decoded total:</b> ${input.liveStats.wsDecoded} ${escapeHtml(input.symbol)} Transfer event(s)`,
+    `<b>WebSocket matched total:</b> ${input.liveStats.wsMatched}`,
+    `<b>HTTP backfill scanned blocks:</b> ${input.liveStats.httpScannedBlocks}`,
+    `<b>HTTP backfill matched:</b> ${input.liveStats.httpMatched}`,
+    `<b>Alerts delivered:</b> ${input.liveStats.deliveredAlerts}`,
+    `<b>Last WS block:</b> ${input.liveStats.lastWsBlock || "none"}`,
+    `<b>Last HTTP block:</b> ${input.liveStats.lastHttpBlock || "none"}`
+  ].join("\n");
+
+  await safeSendTelegramMessage(
+    input.telegramToken,
+    input.replyChatId,
+    message,
+    input.telegramTimeoutMs,
+    input.telegramRetries,
+    "status command"
+  );
+}
+
 async function fetchIndexedTransferAlerts(input: {
   indexedApi: IndexedApiConfig;
   wallets: WalletConfig[];
@@ -1260,6 +1467,7 @@ async function fetchIndexedTransferAlerts(input: {
   toBlock: number;
   symbol: string;
   decimals: number;
+  minAlertRawValue: bigint;
   alertIncoming: boolean;
   alertOutgoing: boolean;
   sort: "asc" | "desc";
@@ -1314,11 +1522,19 @@ async function fetchIndexedTransferAlerts(input: {
       if (direction === "Inflow" && !input.alertIncoming) continue;
       if (direction === "Outflow" && !input.alertOutgoing) continue;
 
+      const rawValue = BigInt(transfer.value);
       const transferDecimals = Number(transfer.tokenDecimal ?? input.decimals);
+      const normalizedRawValue =
+        transferDecimals === input.decimals
+          ? rawValue
+          : rawValue * 10n ** BigInt(input.decimals) / 10n ** BigInt(transferDecimals);
+      if (normalizedRawValue < input.minAlertRawValue) continue;
+
       alerts.push({
         direction,
         wallet: matchedWallet,
-        amount: formatTokenAmount(BigInt(transfer.value), transferDecimals),
+        amount: formatTokenAmount(rawValue, transferDecimals),
+        rawValue: normalizedRawValue,
         symbol: transfer.tokenSymbol || input.symbol,
         from: transfer.from,
         to: transfer.to,
@@ -1342,6 +1558,7 @@ async function sendRecentRealTransferAlerts(input: {
   walletTopics: string[];
   symbol: string;
   decimals: number;
+  minAlertRawValue: bigint;
   currentBlock: number;
   confirmations: number;
   blockRange: number;
@@ -1373,6 +1590,7 @@ async function sendRecentRealTransferAlerts(input: {
       toBlock: targetBlock,
       symbol: input.symbol,
       decimals: input.decimals,
+      minAlertRawValue: input.minAlertRawValue,
       alertIncoming: input.alertIncoming,
       alertOutgoing: input.alertOutgoing,
       sort: "desc",
@@ -1440,7 +1658,8 @@ async function sendRecentRealTransferAlerts(input: {
         parsedArgs: parsed.args,
         walletByAddress: input.walletByAddress,
         symbol: input.symbol,
-        decimals: input.decimals
+        decimals: input.decimals,
+        minAlertRawValue: input.minAlertRawValue
       });
       if (!alert) continue;
 

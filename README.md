@@ -27,6 +27,12 @@ TELEGRAM_CHAT_IDS=
 
 `TELEGRAM_CHAT_ID` is kept for single-chat backward compatibility.
 
+Hourly health updates can be sent to a separate chat list:
+
+```bash
+TELEGRAM_HEALTH_CHAT_IDS=8010090311
+```
+
 4. Build and run:
 
 ```bash
@@ -52,6 +58,8 @@ USE_WEBSOCKET=true
 The bot can use WebSocket live subscriptions for new USDT transfers. The HTTP RPC list is used for startup checks and `/verify` commands.
 
 `LOG_WEBSOCKET_DECODED_SUMMARY=true` prints a periodic count of decoded USDT transfer events so you can see the WebSocket stream is alive without logging every transfer.
+
+`TELEGRAM_HEALTH_UPDATE_ENABLED=true` sends an hourly Telegram health update with decoded WebSocket events, HTTP backfill progress, matched transfers, and delivered alert count.
 
 When a URL contains `gateway.tatum.io`, the bot sends `TATUM_API_KEY` as the `x-api-key` header.
 
@@ -85,6 +93,8 @@ That mode can skip alerts for transfers that happen while the bot is offline. If
 
 Each alert includes direction, wallet label, amount, from, to, transaction hash, block number, and BscScan transaction link.
 
+`MIN_ALERT_AMOUNT=1` ignores transfer alerts below 1 USDT.
+
 On startup, the bot sends a Telegram status message if `ALERT_ON_STARTUP=true`.
 
 For testing, `SEND_TEST_ALERTS_ON_STARTUP=true` sends one simulated Telegram alert per watched wallet. These messages are clearly marked as tests and do not mean a real transfer happened.
@@ -112,10 +122,11 @@ When `TELEGRAM_COMMANDS_ENABLED=true`, send commands to the bot chat:
 ```text
 /verify 98456008
 /verify 98456008 98456013
+/status
 /balances
 /chatid
 ```
 
-The range is capped at 10 blocks. The bot replies with matching transfers or a no-match message. `/balances` returns current USDT balances for watched wallets. `/chatid` replies with the exact Telegram Bot API chat ID for the chat where it was sent.
+The range is capped at 10 blocks. The bot replies with matching transfers or a no-match message. `/status` returns current monitor counters. `/balances` returns current BNB and USDT balances for watched wallets. `/chatid` replies with the exact Telegram Bot API chat ID for the chat where it was sent.
 
 `LOG_SCAN_PROGRESS=true` prints each scanned block range and the number of matching logs found.
