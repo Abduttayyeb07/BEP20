@@ -11,19 +11,19 @@ import {
   type Log
 } from "ethers";
 
-const USDT_ADDRESS = "0x55d398326f99059fF775485246999027B3197955";
+export const USDT_ADDRESS = "0x55d398326f99059fF775485246999027B3197955";
 const TRANSFER_TOPIC =
   "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const CHAIN_ID = 56n;
 
-const ERC20_ABI = [
+export const ERC20_ABI = [
   "event Transfer(address indexed from, address indexed to, uint256 value)",
   "function decimals() view returns (uint8)",
   "function symbol() view returns (string)",
   "function balanceOf(address account) view returns (uint256)"
 ] as const;
 
-type WalletConfig = {
+export type WalletConfig = {
   label: string;
   address: string;
 };
@@ -32,7 +32,7 @@ type SavedState = {
   lastProcessedBlock: number;
 };
 
-type TransferAlert = {
+export type TransferAlert = {
   direction: "Inflow" | "Outflow";
   wallet: WalletConfig;
   amount: string;
@@ -53,6 +53,10 @@ type LiveStats = {
   lastHttpBlock: number;
   lastWsBlock: number;
   startedAt: number;
+};
+
+type WebSocketMonitorController = {
+  reconnect(): Promise<void>;
 };
 
 type IndexedTransfer = {
@@ -249,7 +253,7 @@ function getIndexedApiConfig(): IndexedApiConfig | null {
   return null;
 }
 
-function normalizeAddress(address: string): string {
+export function normalizeAddress(address: string): string {
   return address.toLowerCase();
 }
 
@@ -302,7 +306,7 @@ function escapeHtml(value: string): string {
     .replaceAll(">", "&gt;");
 }
 
-function formatTokenAmount(rawValue: bigint, decimals: number): string {
+export function formatTokenAmount(rawValue: bigint, decimals: number): string {
   const base = 10n ** BigInt(decimals);
   const whole = rawValue / base;
   const fraction = rawValue % base;
@@ -433,6 +437,10 @@ async function main(): Promise<void> {
   const webSocketDecodedSummaryIntervalMs = optionalNumberEnv(
     "WEBSOCKET_DECODED_SUMMARY_INTERVAL_MS",
     30_000
+  );
+  const webSocketStallCheckIntervalMs = optionalNumberEnv(
+    "WEBSOCKET_STALL_CHECK_INTERVAL_MS",
+    60_000
   );
   const telegramHealthUpdateEnabled = optionalBooleanEnv("TELEGRAM_HEALTH_UPDATE_ENABLED", true);
   const telegramHealthUpdateIntervalMs = optionalNumberEnv(
@@ -640,8 +648,10 @@ async function main(): Promise<void> {
     });
   }
 
+  let webSocketController: WebSocketMonitorController | null = null;
+
   if (useWebSocket) {
-    await startWebSocketMonitor({
+    webSocketController = await startWebSocketMonitor({
       wsUrls,
       usdt,
       telegramToken,
@@ -663,6 +673,15 @@ async function main(): Promise<void> {
 
     console.log("WebSocket live monitoring active");
     console.log("HTTP backfill monitoring active");
+    startWebSocketWatchdog({
+      controller: webSocketController,
+      telegramToken,
+      telegramHealthChatIds,
+      telegramTimeoutMs,
+      telegramRetries,
+      intervalMs: webSocketStallCheckIntervalMs,
+      stats: liveStats
+    });
   }
 
   if (telegramHealthUpdateEnabled) {
@@ -816,7 +835,7 @@ async function main(): Promise<void> {
   }
 }
 
-function buildTransferAlert(input: {
+export function buildTransferAlert(input: {
   log: Log;
   parsedArgs: unknown;
   walletByAddress: Map<string, WalletConfig>;
@@ -863,7 +882,7 @@ function buildTransferAlertMessage(alert: TransferAlert, prefix = ""): string {
   ].join("\n");
 }
 
-function parseTokenAmount(value: string, decimals: number): bigint {
+export function parseTokenAmount(value: string, decimals: number): bigint {
   const trimmed = value.trim();
   if (!/^\d+(\.\d+)?$/.test(trimmed)) {
     throw new Error("MIN_ALERT_AMOUNT must be a non-negative decimal number");
@@ -874,7 +893,7 @@ function parseTokenAmount(value: string, decimals: number): bigint {
   return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(normalizedFraction || "0");
 }
 
-function buildAlertKey(alert: TransferAlert): string {
+export function buildAlertKey(alert: TransferAlert): string {
   return `${alert.transactionHash}:${alert.direction}:${normalizeAddress(alert.wallet.address)}`;
 }
 
@@ -993,8 +1012,10 @@ async function startWebSocketMonitor(input: {
   decodedSummaryIntervalMs: number;
   deliveredAlertKeys: Set<string>;
   liveStats: LiveStats;
-}): Promise<void> {
-  const { provider, wsUrl } = await connectWebSocketProvider(input.wsUrls);
+}): Promise<WebSocketMonitorController> {
+  let provider: WebSocketProvider | null = null;
+  let currentWsUrl = "";
+  let reconnecting = false;
   const seenLogs = new Set<string>();
   let decodedCount = 0;
   let matchedCount = 0;
@@ -1014,58 +1035,83 @@ async function startWebSocketMonitor(input: {
     topics: [TRANSFER_TOPIC]
   };
 
-  console.log(`Subscribing once: ${input.symbol} Transfer events on ${USDT_ADDRESS}`);
-  provider.on(filter, (log: Log) => {
-    void (async () => {
-      const logKey = `${log.transactionHash}:${log.index}`;
-      if (seenLogs.has(logKey)) return;
-      seenLogs.add(logKey);
+  const attachSubscription = (activeProvider: WebSocketProvider) => {
+    console.log(`Subscribing once: ${input.symbol} Transfer events on ${USDT_ADDRESS}`);
+    activeProvider.on(filter, (log: Log) => {
+      void (async () => {
+        const logKey = `${log.transactionHash}:${log.index}`;
+        if (seenLogs.has(logKey)) return;
+        seenLogs.add(logKey);
 
-      const parsed = input.usdt.interface.parseLog(log);
-      if (!parsed) return;
-      decodedCount += 1;
-      input.liveStats.wsDecoded += 1;
-      input.liveStats.lastWsBlock = Math.max(input.liveStats.lastWsBlock, log.blockNumber);
+        const parsed = input.usdt.interface.parseLog(log);
+        if (!parsed) return;
+        decodedCount += 1;
+        input.liveStats.wsDecoded += 1;
+        input.liveStats.lastWsBlock = Math.max(input.liveStats.lastWsBlock, log.blockNumber);
 
-      const alert = buildTransferAlert({
-        log,
-        parsedArgs: parsed.args,
-        walletByAddress: input.walletByAddress,
-        symbol: input.symbol,
-        decimals: input.decimals,
-        minAlertRawValue: input.minAlertRawValue
+        const alert = buildTransferAlert({
+          log,
+          parsedArgs: parsed.args,
+          walletByAddress: input.walletByAddress,
+          symbol: input.symbol,
+          decimals: input.decimals,
+          minAlertRawValue: input.minAlertRawValue
+        });
+        if (!alert) return;
+        if (alert.direction === "Inflow" && !input.alertIncoming) return;
+        if (alert.direction === "Outflow" && !input.alertOutgoing) return;
+        const alertKey = buildAlertKey(alert);
+        if (input.deliveredAlertKeys.has(alertKey)) return;
+        input.deliveredAlertKeys.add(alertKey);
+        matchedCount += 1;
+        input.liveStats.wsMatched += 1;
+
+        console.log(
+          `WebSocket matched ${alert.symbol} ${alert.direction}: wallet=${alert.wallet.label}, amount=${alert.amount}, block=${alert.blockNumber}, tx=${alert.transactionHash}`
+        );
+
+        await sendTelegramBroadcast(
+          input.telegramToken,
+          input.telegramChatIds,
+          buildTransferAlertMessage(alert),
+          input.telegramTimeoutMs,
+          input.telegramRetries
+        );
+        input.liveStats.deliveredAlerts += 1;
+
+        console.log(
+          `WebSocket ${alert.direction.toLowerCase()} ${alert.amount} ${alert.symbol} for ${alert.wallet.label}: ${alert.transactionHash}`
+        );
+      })().catch((error) => {
+        console.warn(`WebSocket alert handling failed: ${formatError(error)}`);
       });
-      if (!alert) return;
-      if (alert.direction === "Inflow" && !input.alertIncoming) return;
-      if (alert.direction === "Outflow" && !input.alertOutgoing) return;
-      const alertKey = buildAlertKey(alert);
-      if (input.deliveredAlertKeys.has(alertKey)) return;
-      input.deliveredAlertKeys.add(alertKey);
-      matchedCount += 1;
-      input.liveStats.wsMatched += 1;
-
-      console.log(
-        `WebSocket matched ${alert.symbol} ${alert.direction}: wallet=${alert.wallet.label}, amount=${alert.amount}, block=${alert.blockNumber}, tx=${alert.transactionHash}`
-      );
-
-      await sendTelegramBroadcast(
-        input.telegramToken,
-        input.telegramChatIds,
-        buildTransferAlertMessage(alert),
-        input.telegramTimeoutMs,
-        input.telegramRetries
-      );
-      input.liveStats.deliveredAlerts += 1;
-
-      console.log(
-        `WebSocket ${alert.direction.toLowerCase()} ${alert.amount} ${alert.symbol} for ${alert.wallet.label}: ${alert.transactionHash}`
-      );
-    })().catch((error) => {
-      console.warn(`WebSocket alert handling failed: ${formatError(error)}`);
     });
-  });
+  };
 
-  console.log(`Subscribed to USDT Transfer events over WebSocket: ${wsUrl}`);
+  const reconnect = async () => {
+    if (reconnecting) return;
+    reconnecting = true;
+
+    if (provider) {
+      provider.removeAllListeners();
+      await provider.destroy();
+      provider = null;
+    }
+
+    try {
+      const connected = await connectWebSocketProvider(input.wsUrls);
+      provider = connected.provider;
+      currentWsUrl = connected.wsUrl;
+      attachProviderLifecycleHandlers(provider, reconnect);
+      attachSubscription(provider);
+      console.log(`Subscribed to USDT Transfer events over WebSocket: ${currentWsUrl}`);
+    } finally {
+      reconnecting = false;
+    }
+  };
+
+  await reconnect();
+  return { reconnect };
 }
 
 function startTelegramHealthUpdates(input: {
@@ -1122,6 +1168,81 @@ function startTelegramHealthUpdates(input: {
   }, input.intervalMs);
 }
 
+function startWebSocketWatchdog(input: {
+  controller: WebSocketMonitorController;
+  telegramToken: string;
+  telegramHealthChatIds: string[];
+  telegramTimeoutMs: number;
+  telegramRetries: number;
+  intervalMs: number;
+  stats: LiveStats;
+}): NodeJS.Timeout {
+  let lastWsDecoded = input.stats.wsDecoded;
+  let lastHttpBlock = input.stats.lastHttpBlock;
+  let reconnecting = false;
+
+  const reconnect = async (reason: string) => {
+    if (reconnecting) return;
+    reconnecting = true;
+
+    await safeSendTelegramBroadcast(
+      input.telegramToken,
+      input.telegramHealthChatIds,
+      [
+        `<b>${escapeHtml(reason)}</b>`,
+        "",
+        "<b>WebSocket appears stalled. Reconnecting...</b>",
+        `<b>Last WS block:</b> ${input.stats.lastWsBlock || "none"}`,
+        `<b>Last HTTP block:</b> ${input.stats.lastHttpBlock || "none"}`
+      ].join("\n"),
+      input.telegramTimeoutMs,
+      input.telegramRetries,
+      "websocket reconnecting alert"
+    );
+
+    try {
+      await input.controller.reconnect();
+      lastWsDecoded = input.stats.wsDecoded;
+      lastHttpBlock = input.stats.lastHttpBlock;
+      await safeSendTelegramBroadcast(
+        input.telegramToken,
+        input.telegramHealthChatIds,
+        [
+          "<b>WebSocket reconnected successfully.</b>",
+          "",
+          `<b>Last HTTP block:</b> ${input.stats.lastHttpBlock || "none"}`
+        ].join("\n"),
+        input.telegramTimeoutMs,
+        input.telegramRetries,
+        "websocket reconnected alert"
+      );
+    } catch (error) {
+      await safeSendTelegramBroadcast(
+        input.telegramToken,
+        input.telegramHealthChatIds,
+        `WebSocket reconnect failed: ${escapeHtml(formatError(error))}`,
+        input.telegramTimeoutMs,
+        input.telegramRetries,
+        "websocket reconnect failed alert"
+      );
+    } finally {
+      reconnecting = false;
+    }
+  };
+
+  return setInterval(() => {
+    const wsDecodedDelta = input.stats.wsDecoded - lastWsDecoded;
+    const httpAdvanced = input.stats.lastHttpBlock > lastHttpBlock;
+
+    lastWsDecoded = input.stats.wsDecoded;
+    lastHttpBlock = input.stats.lastHttpBlock;
+
+    if (wsDecodedDelta === 0 && httpAdvanced) {
+      void reconnect("WebSocket decoded 0 events while HTTP backfill advanced.");
+    }
+  }, input.intervalMs);
+}
+
 async function connectWebSocketProvider(
   wsUrls: string[]
 ): Promise<{ provider: WebSocketProvider; wsUrl: string }> {
@@ -1146,6 +1267,41 @@ async function connectWebSocketProvider(
   }
 
   throw new Error(`No usable BSC WebSocket endpoint found:\n${errors.join("\n")}`);
+}
+
+function attachProviderLifecycleHandlers(
+  provider: WebSocketProvider,
+  reconnect: () => Promise<void>
+): void {
+  provider.on("error", (error) => {
+    console.warn(`WebSocket provider error: ${formatError(error)}. Reconnecting...`);
+    void reconnect();
+  });
+
+  const websocket = (provider as unknown as {
+    websocket?: {
+      on?: (event: string, handler: (...args: unknown[]) => void) => void;
+      addEventListener?: (event: string, handler: (...args: unknown[]) => void) => void;
+    };
+  }).websocket;
+  if (!websocket) return;
+
+  const onClose = () => {
+    console.warn("WebSocket closed. Reconnecting...");
+    void reconnect();
+  };
+  const onError = (error: unknown) => {
+    console.warn(`WebSocket transport error: ${formatError(error)}. Reconnecting...`);
+    void reconnect();
+  };
+
+  if (typeof websocket.on === "function") {
+    websocket.on("close", onClose);
+    websocket.on("error", onError);
+  } else if (typeof websocket.addEventListener === "function") {
+    websocket.addEventListener("close", onClose);
+    websocket.addEventListener("error", onError);
+  }
 }
 
 function startTelegramCommandPoller(input: {
@@ -1263,7 +1419,9 @@ async function handleTelegramCommand(
   const command = commandWithBot.split("@")[0]?.toLowerCase();
 
   if (command !== "/verify") {
-    if (command === "/status") {
+    if (command === "/blocks") {
+      await handleBlocksCommand(input);
+    } else if (command === "/status") {
       await handleStatusCommand(input);
     } else if (command === "/balances") {
       await handleBalancesCommand(input);
@@ -1280,7 +1438,7 @@ async function handleTelegramCommand(
       await safeSendTelegramMessage(
         input.telegramToken,
         input.replyChatId,
-        "Commands:\n<code>/status</code>\n<code>/balances</code>\n<code>/verify 98456008</code>\n<code>/verify 98456008 98456013</code>\n<code>/chatid</code>\n\nRange limit: 10 blocks.",
+        "Commands:\n<code>/status</code>\n<code>/blocks</code>\n<code>/balances</code>\n<code>/verify 98456008</code>\n<code>/verify 98456008 98456013</code>\n<code>/chatid</code>\n\nRange limit: 10 blocks.",
         input.telegramTimeoutMs,
         input.telegramRetries,
         "help command"
@@ -1457,6 +1615,52 @@ async function handleStatusCommand(input: {
     input.telegramRetries,
     "status command"
   );
+}
+
+async function handleBlocksCommand(input: {
+  provider: RpcProvider;
+  telegramToken: string;
+  replyChatId: string;
+  telegramTimeoutMs: number;
+  telegramRetries: number;
+  liveStats: LiveStats;
+}): Promise<void> {
+  try {
+    const latestBlock = await input.provider.getBlockNumber();
+    const httpBacklog = Math.max(0, latestBlock - input.liveStats.lastHttpBlock);
+    const wsBacklog =
+      input.liveStats.lastWsBlock > 0 ? Math.max(0, latestBlock - input.liveStats.lastWsBlock) : null;
+
+    const message = [
+      "<b>BSC Block Status</b>",
+      "",
+      `<b>Latest block:</b> ${latestBlock}`,
+      `<b>Last HTTP block:</b> ${input.liveStats.lastHttpBlock || "none"}`,
+      `<b>HTTP backlog:</b> ${httpBacklog} block(s)`,
+      `<b>Last WS block:</b> ${input.liveStats.lastWsBlock || "none"}`,
+      `<b>WS behind:</b> ${wsBacklog === null ? "unknown" : `${wsBacklog} block(s)`}`,
+      `<b>WS decoded total:</b> ${input.liveStats.wsDecoded}`,
+      `<b>HTTP scanned total:</b> ${input.liveStats.httpScannedBlocks}`
+    ].join("\n");
+
+    await safeSendTelegramMessage(
+      input.telegramToken,
+      input.replyChatId,
+      message,
+      input.telegramTimeoutMs,
+      input.telegramRetries,
+      "blocks command"
+    );
+  } catch (error) {
+    await safeSendTelegramMessage(
+      input.telegramToken,
+      input.replyChatId,
+      `Block status failed: ${escapeHtml(formatError(error))}`,
+      input.telegramTimeoutMs,
+      input.telegramRetries,
+      "blocks command failed"
+    );
+  }
 }
 
 async function fetchIndexedTransferAlerts(input: {
@@ -1812,10 +2016,12 @@ async function fetchTransferLogs(
   });
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+if (process.env.NODE_ENV !== "test") {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}
 
 process.on("unhandledRejection", (error) => {
   console.warn(`Unhandled async error: ${formatError(error)}`);

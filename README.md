@@ -59,6 +59,8 @@ The bot can use WebSocket live subscriptions for new USDT transfers. The HTTP RP
 
 `LOG_WEBSOCKET_DECODED_SUMMARY=true` prints a periodic count of decoded USDT transfer events so you can see the WebSocket stream is alive without logging every transfer.
 
+`WEBSOCKET_STALL_CHECK_INTERVAL_MS=60000` checks once per minute whether WebSocket appears stalled while HTTP backfill is still advancing, then reconnects automatically and alerts only the health chat.
+
 `TELEGRAM_HEALTH_UPDATE_ENABLED=true` sends an hourly Telegram health update with decoded WebSocket events, HTTP backfill progress, matched transfers, and delivered alert count.
 
 When a URL contains `gateway.tatum.io`, the bot sends `TATUM_API_KEY` as the `x-api-key` header.
@@ -123,10 +125,11 @@ When `TELEGRAM_COMMANDS_ENABLED=true`, send commands to the bot chat:
 /verify 98456008
 /verify 98456008 98456013
 /status
+/blocks
 /balances
 /chatid
 ```
 
-The range is capped at 10 blocks. The bot replies with matching transfers or a no-match message. `/status` returns current monitor counters. `/balances` returns current BNB and USDT balances for watched wallets. `/chatid` replies with the exact Telegram Bot API chat ID for the chat where it was sent.
+The range is capped at 10 blocks. The bot replies with matching transfers or a no-match message. `/status` returns current monitor counters. `/blocks` returns latest block, HTTP backlog, and WebSocket block position. `/balances` returns current BNB and USDT balances for watched wallets. `/chatid` replies with the exact Telegram Bot API chat ID for the chat where it was sent.
 
 `LOG_SCAN_PROGRESS=true` prints each scanned block range and the number of matching logs found.
