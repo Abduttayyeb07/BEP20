@@ -1041,6 +1041,7 @@ async function startWebSocketMonitor(input: {
       void (async () => {
         const logKey = `${log.transactionHash}:${log.index}`;
         if (seenLogs.has(logKey)) return;
+        if (seenLogs.size >= 200_000) seenLogs.clear();
         seenLogs.add(logKey);
 
         const parsed = input.usdt.interface.parseLog(log);
