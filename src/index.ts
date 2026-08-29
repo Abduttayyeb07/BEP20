@@ -5,6 +5,7 @@ import {
   Contract,
   FetchRequest,
   JsonRpcProvider,
+  Network,
   WebSocketProvider,
   formatEther,
   isAddress,
@@ -457,6 +458,7 @@ async function main(): Promise<void> {
   const confirmations = optionalNumberEnv("CONFIRMATIONS", 1);
   const maxBlockRange = optionalNumberEnv("MAX_BLOCK_RANGE", 5);
   const maxBacklogBlocks = optionalNumberEnv("MAX_BACKLOG_BLOCKS", 25);
+  const httpBackfillWorkers = optionalNumberEnv("HTTP_BACKFILL_WORKERS", 1);
   const stateFile = process.env.STATE_FILE?.trim() || "/app/data/state.json";
   const alertIncoming = optionalBooleanEnv("ALERT_INCOMING", true);
   const alertOutgoing = optionalBooleanEnv("ALERT_OUTGOING", true);
@@ -492,6 +494,20 @@ async function main(): Promise<void> {
 
   const { provider, rpcUrl } = await connectProvider(rpcUrls, rpcTimeoutMs);
   const rateLimitedProvider = new RateLimitedProvider(provider, rpcMinDelayMs);
+
+  // One rate-limited provider per RPC URL for parallel HTTP backfill workers
+  const tatumApiKey = process.env.TATUM_API_KEY?.trim();
+  const workerProviders: RateLimitedProvider[] = rpcUrls.map((url) => {
+    const connection = new FetchRequest(url);
+    if (tatumApiKey && url.includes("gateway.tatum.io")) {
+      connection.setHeader("x-api-key", tatumApiKey);
+    }
+    const p = new JsonRpcProvider(connection, Number(CHAIN_ID), {
+      batchMaxCount: 1,
+      staticNetwork: Network.from(Number(CHAIN_ID))
+    });
+    return new RateLimitedProvider(p, rpcMinDelayMs);
+  });
 
   const usdt = new Contract(USDT_ADDRESS, ERC20_ABI, provider);
   console.log(`Connected to BSC RPC. Using token metadata: ${symbol}, decimals=${decimals}`);
@@ -720,114 +736,151 @@ async function main(): Promise<void> {
         );
       }
 
-      const fromBlock = lastProcessedBlock + 1;
-      const toBlock = Math.min(targetBlock, fromBlock + maxBlockRange - 1);
+      // Build N non-overlapping block ranges for parallel workers
+      const workerCount = Math.min(httpBackfillWorkers, workerProviders.length);
+      const ranges: Array<{ from: number; to: number }> = [];
+      let rangeStart = lastProcessedBlock + 1;
+      for (let i = 0; i < workerCount && rangeStart <= targetBlock; i++) {
+        const rangeEnd = Math.min(targetBlock, rangeStart + maxBlockRange - 1);
+        ranges.push({ from: rangeStart, to: rangeEnd });
+        rangeStart = rangeEnd + 1;
+      }
+
       const remainingBacklog = targetBlock - lastProcessedBlock;
-      liveStats.lastHttpBlock = toBlock;
-      liveStats.httpScannedBlocks += toBlock - fromBlock + 1;
+      if (logScanProgress) {
+        const rangeDesc = ranges.map((r) => `${r.from}-${r.to}`).join(", ");
+        console.log(
+          `Live scan [${rangeDesc}]; latest=${latestBlock}; backlog=${remainingBacklog} block(s)`
+        );
+      }
+
+      // Fetch logs for all ranges in parallel, each using its own provider
+      const workerResults = await Promise.allSettled(
+        ranges.map(async (range, i) => {
+          const wp = workerProviders[i % workerProviders.length];
+          let logs: Log[] = [];
+          let indexedFallbackAlerts: TransferAlert[] = [];
+          try {
+            logs = await fetchTransferLogs(wp, range.from, range.to, walletTopics, {
+              incoming: alertIncoming,
+              outgoing: alertOutgoing,
+              timeoutMs: rpcTimeoutMs
+            });
+          } catch (error) {
+            if (!indexedApi) throw error;
+            console.warn(
+              `Worker ${i} RPC scan failed: ${formatError(error)}. Trying ${indexedApi.name} fallback for ${range.from}-${range.to}.`
+            );
+            indexedFallbackAlerts = await fetchIndexedTransferAlerts({
+              indexedApi,
+              wallets: watchedWallets,
+              walletByAddress,
+              fromBlock: range.from,
+              toBlock: range.to,
+              symbol,
+              decimals,
+              minAlertRawValue,
+              alertIncoming,
+              alertOutgoing,
+              sort: "asc",
+              limitPerWallet: 100
+            });
+          }
+          return { range, logs, indexedFallbackAlerts };
+        })
+      );
 
       if (logScanProgress) {
+        const totalLogs = workerResults.reduce(
+          (acc, r) =>
+            r.status === "fulfilled"
+              ? acc + r.value.logs.length + r.value.indexedFallbackAlerts.length
+              : acc,
+          0
+        );
         console.log(
-          `Live scan ${fromBlock}-${toBlock}; latest=${latestBlock}; backlog=${remainingBacklog} block(s)`
+          `Live scan result: ${totalLogs} matching ${symbol} transfer(s) across ${ranges.length} worker(s) | WebSocket decoded total=${liveStats.wsDecoded}, matched total=${liveStats.wsMatched}, last WS block=${liveStats.lastWsBlock || "none"}`
         );
       }
 
-      let logs: Log[] = [];
-      let indexedFallbackAlerts: TransferAlert[] = [];
-      try {
-        logs = await fetchTransferLogs(rateLimitedProvider, fromBlock, toBlock, walletTopics, {
-          incoming: alertIncoming,
-          outgoing: alertOutgoing,
-          timeoutMs: rpcTimeoutMs
-        });
-      } catch (error) {
-        if (!indexedApi) throw error;
-
-        console.warn(
-          `RPC log scan failed: ${formatError(error)}. Trying ${indexedApi.name} fallback for ${fromBlock}-${toBlock}.`
-        );
-        indexedFallbackAlerts = await fetchIndexedTransferAlerts({
-          indexedApi,
-          wallets: watchedWallets,
-          walletByAddress,
-          fromBlock,
-          toBlock,
-          symbol,
-          decimals,
-          minAlertRawValue,
-          alertIncoming,
-          alertOutgoing,
-          sort: "asc",
-          limitPerWallet: 100
-        });
-      }
-
-      if (logScanProgress) {
-        console.log(
-          `Live scan result: ${logs.length + indexedFallbackAlerts.length} matching ${symbol} transfer(s) | WebSocket decoded total=${liveStats.wsDecoded}, matched total=${liveStats.wsMatched}, last WS block=${liveStats.lastWsBlock || "none"}`
-        );
-      }
-
+      // Process results in block order; stop advancing on first worker failure
       const seenLogs = new Set<string>();
       const seenAlerts = new Set<string>();
-      for (const log of logs) {
-        const logKey = `${log.transactionHash}:${log.index}`;
-        if (seenLogs.has(logKey)) continue;
-        seenLogs.add(logKey);
 
-        const parsed = usdt.interface.parseLog(log);
-        if (!parsed) continue;
+      for (let i = 0; i < workerResults.length; i++) {
+        const result = workerResults[i];
+        const range = ranges[i];
 
-        const alert = buildTransferAlert({
-          log,
-          parsedArgs: parsed.args,
-          walletByAddress,
-          symbol,
-          decimals,
-          minAlertRawValue
-        });
-        if (!alert) continue;
-        const alertKey = buildAlertKey(alert);
-        if (deliveredAlertKeys.has(alertKey)) continue;
-        deliveredAlertKeys.add(alertKey);
-        liveStats.httpMatched += 1;
+        if (result.status === "rejected") {
+          console.warn(
+            `Worker ${i} failed for blocks ${range.from}-${range.to}: ${result.reason}. Retrying this range next tick.`
+          );
+          break; // don't advance lastProcessedBlock past this gap
+        }
 
-        await sendTelegramBroadcast(
-          telegramToken,
-          telegramChatIds,
-          buildTransferAlertMessage(alert),
-          telegramTimeoutMs,
-          telegramRetries
-        );
-        liveStats.deliveredAlerts += 1;
-        console.log(
-          `${alert.direction} ${alert.amount} ${symbol} for ${alert.wallet.label}: ${log.transactionHash}`
-        );
+        const { logs, indexedFallbackAlerts } = result.value;
+        liveStats.httpScannedBlocks += range.to - range.from + 1;
+        liveStats.lastHttpBlock = range.to;
+
+        for (const log of logs) {
+          const logKey = `${log.transactionHash}:${log.index}`;
+          if (seenLogs.has(logKey)) continue;
+          seenLogs.add(logKey);
+
+          const parsed = usdt.interface.parseLog(log);
+          if (!parsed) continue;
+
+          const alert = buildTransferAlert({
+            log,
+            parsedArgs: parsed.args,
+            walletByAddress,
+            symbol,
+            decimals,
+            minAlertRawValue
+          });
+          if (!alert) continue;
+          const alertKey = buildAlertKey(alert);
+          if (deliveredAlertKeys.has(alertKey)) continue;
+          deliveredAlertKeys.add(alertKey);
+          liveStats.httpMatched += 1;
+
+          await sendTelegramBroadcast(
+            telegramToken,
+            telegramChatIds,
+            buildTransferAlertMessage(alert),
+            telegramTimeoutMs,
+            telegramRetries
+          );
+          liveStats.deliveredAlerts += 1;
+          console.log(
+            `${alert.direction} ${alert.amount} ${symbol} for ${alert.wallet.label}: ${log.transactionHash}`
+          );
+        }
+
+        for (const alert of indexedFallbackAlerts) {
+          const alertKey = `${alert.transactionHash}:${alert.direction}:${alert.wallet.address}`;
+          if (seenAlerts.has(alertKey)) continue;
+          seenAlerts.add(alertKey);
+          if (deliveredAlertKeys.has(alertKey)) continue;
+          deliveredAlertKeys.add(alertKey);
+          liveStats.httpMatched += 1;
+
+          await sendTelegramBroadcast(
+            telegramToken,
+            telegramChatIds,
+            buildTransferAlertMessage(alert),
+            telegramTimeoutMs,
+            telegramRetries
+          );
+          liveStats.deliveredAlerts += 1;
+          console.log(
+            `${alert.direction} ${alert.amount} ${symbol} for ${alert.wallet.label}: ${alert.transactionHash}`
+          );
+        }
+
+        lastProcessedBlock = range.to;
+        await writeState(stateFile, { lastProcessedBlock });
       }
-
-      for (const alert of indexedFallbackAlerts) {
-        const alertKey = `${alert.transactionHash}:${alert.direction}:${alert.wallet.address}`;
-        if (seenAlerts.has(alertKey)) continue;
-        seenAlerts.add(alertKey);
-        if (deliveredAlertKeys.has(alertKey)) continue;
-        deliveredAlertKeys.add(alertKey);
-        liveStats.httpMatched += 1;
-
-        await sendTelegramBroadcast(
-          telegramToken,
-          telegramChatIds,
-          buildTransferAlertMessage(alert),
-          telegramTimeoutMs,
-          telegramRetries
-        );
-        liveStats.deliveredAlerts += 1;
-        console.log(
-          `${alert.direction} ${alert.amount} ${symbol} for ${alert.wallet.label}: ${alert.transactionHash}`
-        );
-      }
-
-      lastProcessedBlock = toBlock;
-      await writeState(stateFile, { lastProcessedBlock });
     } catch (error) {
       console.warn(`Live scan failed: ${formatError(error)}. Retrying same block range.`);
       await sleep(Math.max(pollIntervalMs, 15_000));
